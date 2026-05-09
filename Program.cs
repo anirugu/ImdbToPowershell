@@ -1,26 +1,36 @@
+using System.IO.Compression;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Text;
+using Microsoft.Extensions.Configuration;
+using Npgsql;
 
-string[] urls =
+(string Url, string Table)[] datasets =
 {
-    "https://datasets.imdbws.com/name.basics.tsv.gz",
-    "https://datasets.imdbws.com/title.akas.tsv.gz",
-    "https://datasets.imdbws.com/title.basics.tsv.gz",
-    "https://datasets.imdbws.com/title.crew.tsv.gz",
-    "https://datasets.imdbws.com/title.episode.tsv.gz",
-    "https://datasets.imdbws.com/title.principals.tsv.gz",
-    "https://datasets.imdbws.com/title.ratings.tsv.gz",
+    ("https://datasets.imdbws.com/name.basics.tsv.gz",      "name_basics"),
+    ("https://datasets.imdbws.com/title.akas.tsv.gz",       "title_akas"),
+    ("https://datasets.imdbws.com/title.basics.tsv.gz",     "title_basics"),
+    ("https://datasets.imdbws.com/title.crew.tsv.gz",       "title_crew"),
+    ("https://datasets.imdbws.com/title.episode.tsv.gz",    "title_episode"),
+    ("https://datasets.imdbws.com/title.principals.tsv.gz", "title_principals"),
+    ("https://datasets.imdbws.com/title.ratings.tsv.gz",    "title_ratings"),
 };
 
 string downloadFolder = Path.Combine(AppContext.BaseDirectory, "ImdbData");
 Directory.CreateDirectory(downloadFolder);
 
-using var http = new HttpClient
-{
-    Timeout = TimeSpan.FromMinutes(30),
-};
+IConfigurationRoot config = new ConfigurationBuilder()
+    .SetBasePath(AppContext.BaseDirectory)
+    .AddJsonFile("appsettings.json", optional: false)
+    .Build();
 
-foreach (string url in urls)
+string connString = config.GetConnectionString("Postgres")
+    ?? throw new InvalidOperationException("Connection string 'Postgres' not found in appsettings.json");
+
+using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(30) };
+
+Console.WriteLine("=== Download ===");
+foreach ((string url, _) in datasets)
 {
     string fileName = Path.GetFileName(new Uri(url).LocalPath);
     string localPath = Path.Combine(downloadFolder, fileName);
@@ -44,6 +54,50 @@ foreach (string url in urls)
     }
 }
 
+Console.WriteLine();
+Console.WriteLine("=== Import into PostgreSQL ===");
+
+await using var conn = new NpgsqlConnection(connString);
+await conn.OpenAsync();
+Console.WriteLine($"Conn   : {conn.Host}:{conn.Port}/{conn.Database}");
+
+await EnsureSchemaAsync(conn);
+Console.WriteLine("Schema : ensured");
+
+Dictionary<string, int[]> arrayColumnIndices = new()
+{
+    ["name_basics"]  = new[] { 4, 5 },
+    ["title_basics"] = new[] { 8 },
+    ["title_crew"]   = new[] { 1, 2 },
+};
+
+foreach ((string url, string table) in datasets)
+{
+    string fileName = Path.GetFileName(new Uri(url).LocalPath);
+    string localPath = Path.Combine(downloadFolder, fileName);
+
+    if (!File.Exists(localPath))
+    {
+        Console.WriteLine($"Skip   : {table} (file missing: {fileName})");
+        continue;
+    }
+
+    int[] arrayCols = arrayColumnIndices.TryGetValue(table, out int[]? cols)
+        ? cols
+        : Array.Empty<int>();
+
+    try
+    {
+        await ImportAsync(conn, localPath, table, arrayCols);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine();
+        Console.WriteLine($"Error  : {table} - {ex.Message}");
+    }
+}
+
+Console.WriteLine();
 Console.WriteLine("Done.");
 
 static async Task DownloadAsync(HttpClient http, string url, string fileName, string localPath, string tempPath)
@@ -128,18 +182,18 @@ static async Task DownloadAsync(HttpClient http, string url, string fileName, st
             received += read;
             if ((DateTime.UtcNow - lastReport).TotalSeconds >= 1)
             {
-                WriteProgress(received, totalSize);
+                WriteDownloadProgress(received, totalSize);
                 lastReport = DateTime.UtcNow;
             }
         }
-        WriteProgress(received, totalSize);
+        WriteDownloadProgress(received, totalSize);
         Console.WriteLine();
     }
 
     File.Move(tempPath, localPath);
 }
 
-static void WriteProgress(long received, long? total)
+static void WriteDownloadProgress(long received, long? total)
 {
     double mb = received / 1024.0 / 1024.0;
     if (total is long t && t > 0)
@@ -152,4 +206,141 @@ static void WriteProgress(long received, long? total)
     {
         Console.Write($"\r         {mb,8:F1} MB");
     }
+}
+
+static async Task EnsureSchemaAsync(NpgsqlConnection conn)
+{
+    const string sql = """
+        DROP TABLE IF EXISTS name_basics, title_akas, title_basics, title_crew,
+                             title_episode, title_principals, title_ratings;
+
+        CREATE TABLE name_basics (
+            nconst              TEXT,
+            primary_name        TEXT,
+            birth_year          INTEGER,
+            death_year          INTEGER,
+            primary_profession  TEXT[],
+            known_for_titles    TEXT[]
+        );
+
+        CREATE TABLE title_akas (
+            title_id            TEXT,
+            ordering            INTEGER,
+            title               TEXT,
+            region              TEXT,
+            language            TEXT,
+            types               TEXT,
+            attributes          TEXT,
+            is_original_title   BOOLEAN
+        );
+
+        CREATE TABLE title_basics (
+            tconst              TEXT,
+            title_type          TEXT,
+            primary_title       TEXT,
+            original_title      TEXT,
+            is_adult            BOOLEAN,
+            start_year          INTEGER,
+            end_year            INTEGER,
+            runtime_minutes     INTEGER,
+            genres              TEXT[]
+        );
+
+        CREATE TABLE title_crew (
+            tconst              TEXT,
+            directors           TEXT[],
+            writers             TEXT[]
+        );
+
+        CREATE TABLE title_episode (
+            tconst              TEXT,
+            parent_tconst       TEXT,
+            season_number       INTEGER,
+            episode_number      INTEGER
+        );
+
+        CREATE TABLE title_principals (
+            tconst              TEXT,
+            ordering            INTEGER,
+            nconst              TEXT,
+            category            TEXT,
+            job                 TEXT,
+            characters          JSONB
+        );
+
+        CREATE TABLE title_ratings (
+            tconst              TEXT,
+            average_rating      NUMERIC(3,1),
+            num_votes           INTEGER
+        );
+        """;
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    await cmd.ExecuteNonQueryAsync();
+}
+
+static string WrapArrayFields(string line, int[] indices)
+{
+    string[] fields = line.Split('\t');
+    foreach (int idx in indices)
+    {
+        if (idx >= fields.Length) continue;
+        string v = fields[idx];
+        if (v.Length == 0)
+        {
+            fields[idx] = @"\N";
+        }
+        else if (v != @"\N")
+        {
+            fields[idx] = "{" + v + "}";
+        }
+    }
+    return string.Join('\t', fields);
+}
+
+static async Task ImportAsync(NpgsqlConnection conn, string gzPath, string table, int[] arrayCols)
+{
+    DateTime start = DateTime.UtcNow;
+    DateTime lastReport = DateTime.UtcNow;
+    long rows = 0;
+
+    Console.Write($"Load   : {table} ... ");
+
+    await using NpgsqlTransaction tx = await conn.BeginTransactionAsync();
+
+    await using (var truncate = new NpgsqlCommand($"TRUNCATE TABLE {table}", conn, tx))
+    {
+        await truncate.ExecuteNonQueryAsync();
+    }
+
+    await using FileStream fs = File.OpenRead(gzPath);
+    await using var gz = new GZipStream(fs, CompressionMode.Decompress);
+    using var reader = new StreamReader(gz, Encoding.UTF8);
+
+    await reader.ReadLineAsync();
+
+    await using (TextWriter writer = await conn.BeginTextImportAsync($"COPY {table} FROM STDIN"))
+    {
+        writer.NewLine = "\n";
+        string? line;
+        while ((line = await reader.ReadLineAsync()) != null)
+        {
+            if (arrayCols.Length > 0)
+            {
+                line = WrapArrayFields(line, arrayCols);
+            }
+            await writer.WriteLineAsync(line);
+            rows++;
+            if ((DateTime.UtcNow - lastReport).TotalSeconds >= 2)
+            {
+                Console.Write($"\rLoad   : {table} ... {rows:N0} rows");
+                lastReport = DateTime.UtcNow;
+            }
+        }
+    }
+
+    await tx.CommitAsync();
+
+    TimeSpan elapsed = DateTime.UtcNow - start;
+    Console.WriteLine($"\rLoad   : {table} ... {rows:N0} rows in {elapsed.TotalSeconds:F1}s              ");
 }
