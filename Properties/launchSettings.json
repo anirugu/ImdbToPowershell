@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "ImdbToPowershell": {
+      "commandName": "Project"
+    },
+    "Container (Dockerfile)": {
+      "commandName": "Docker"
+    }
+  }
+}
