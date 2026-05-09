@@ -211,10 +211,7 @@ static void WriteDownloadProgress(long received, long? total)
 static async Task EnsureSchemaAsync(NpgsqlConnection conn)
 {
     const string sql = """
-        DROP TABLE IF EXISTS name_basics, title_akas, title_basics, title_crew,
-                             title_episode, title_principals, title_ratings;
-
-        CREATE TABLE name_basics (
+        CREATE TABLE IF NOT EXISTS name_basics (
             nconst              TEXT,
             primary_name        TEXT,
             birth_year          INTEGER,
@@ -223,7 +220,7 @@ static async Task EnsureSchemaAsync(NpgsqlConnection conn)
             known_for_titles    TEXT[]
         );
 
-        CREATE TABLE title_akas (
+        CREATE TABLE IF NOT EXISTS title_akas (
             title_id            TEXT,
             ordering            INTEGER,
             title               TEXT,
@@ -234,7 +231,7 @@ static async Task EnsureSchemaAsync(NpgsqlConnection conn)
             is_original_title   BOOLEAN
         );
 
-        CREATE TABLE title_basics (
+        CREATE TABLE IF NOT EXISTS title_basics (
             tconst              TEXT,
             title_type          TEXT,
             primary_title       TEXT,
@@ -246,20 +243,20 @@ static async Task EnsureSchemaAsync(NpgsqlConnection conn)
             genres              TEXT[]
         );
 
-        CREATE TABLE title_crew (
+        CREATE TABLE IF NOT EXISTS title_crew (
             tconst              TEXT,
             directors           TEXT[],
             writers             TEXT[]
         );
 
-        CREATE TABLE title_episode (
+        CREATE TABLE IF NOT EXISTS title_episode (
             tconst              TEXT,
             parent_tconst       TEXT,
             season_number       INTEGER,
             episode_number      INTEGER
         );
 
-        CREATE TABLE title_principals (
+        CREATE TABLE IF NOT EXISTS title_principals (
             tconst              TEXT,
             ordering            INTEGER,
             nconst              TEXT,
@@ -268,7 +265,7 @@ static async Task EnsureSchemaAsync(NpgsqlConnection conn)
             characters          JSONB
         );
 
-        CREATE TABLE title_ratings (
+        CREATE TABLE IF NOT EXISTS title_ratings (
             tconst              TEXT,
             average_rating      NUMERIC(3,1),
             num_votes           INTEGER
@@ -300,18 +297,21 @@ static string WrapArrayFields(string line, int[] indices)
 
 static async Task ImportAsync(NpgsqlConnection conn, string gzPath, string table, int[] arrayCols)
 {
+    await using (var probe = new NpgsqlCommand($"SELECT EXISTS (SELECT 1 FROM {table})", conn))
+    {
+        bool hasRows = (bool)(await probe.ExecuteScalarAsync())!;
+        if (hasRows)
+        {
+            Console.WriteLine($"Skip   : {table} (already populated; DROP TABLE {table}; to refresh)");
+            return;
+        }
+    }
+
     DateTime start = DateTime.UtcNow;
     DateTime lastReport = DateTime.UtcNow;
     long rows = 0;
 
     Console.Write($"Load   : {table} ... ");
-
-    await using NpgsqlTransaction tx = await conn.BeginTransactionAsync();
-
-    await using (var truncate = new NpgsqlCommand($"TRUNCATE TABLE {table}", conn, tx))
-    {
-        await truncate.ExecuteNonQueryAsync();
-    }
 
     await using FileStream fs = File.OpenRead(gzPath);
     await using var gz = new GZipStream(fs, CompressionMode.Decompress);
@@ -338,8 +338,6 @@ static async Task ImportAsync(NpgsqlConnection conn, string gzPath, string table
             }
         }
     }
-
-    await tx.CommitAsync();
 
     TimeSpan elapsed = DateTime.UtcNow - start;
     Console.WriteLine($"\rLoad   : {table} ... {rows:N0} rows in {elapsed.TotalSeconds:F1}s              ");
